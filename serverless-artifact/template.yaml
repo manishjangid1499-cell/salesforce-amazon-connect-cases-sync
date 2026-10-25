@@ -1,0 +1,1116 @@
+# Amazon Connect Cases and Salesforce Integration Template
+# This template creates bidirectional sync between Amazon Connect Cases and Salesforce
+# Author: AWS Professional Services
+# Version: 1.0
+
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: "Amazon Connect Cases SalesForce integration - Bidirectional sync between Connect Cases and Salesforce"
+Parameters:
+  CPDomainName:
+    Description: Domain Name of the Customer Profile
+    Type: String
+  CaseDomainName:
+    Description: The Amazon Connect Cases Domain name.
+    Type: String
+  TemplateName:
+    Description: This is the name of the Cases Template.
+    Type: String
+  SalesforceOauthUrl:
+    Type: String
+    Description: "Salesforce Url for OAuth authentication. e.g: https://MyDomainNameSandboxName.my.salesforce.com/services/oauth2/token"
+  SalesforceOauthClientId:
+    Type: String
+    Description: "Salesforce Integration Application Client ID"
+    NoEcho: true
+    MinLength: 1
+    MaxLength: 256
+    Default: "{{resolve:secretsmanager:SalesforceOauthClientId:SecretString:Value}}"
+  SalesforceOauthClientSecret:
+    Type: String
+    Description: "Salesforce Integration Application Client Secret"
+    NoEcho: true
+    MinLength: 1
+    MaxLength: 256
+    Default: "{{resolve:secretsmanager:SalesforceOauthClientSecret:SecretString:Value}}"
+  SalesforceCaseProcessorEndpointUrl:
+    Type: String
+    Description: "Salesforce Endpoint Url to post event from EventBridge. e.g: Custom platform events– https://myDomainName.my.salesforce.com/services/data/versionNumber/sobjects/customPlatformEndpoint"
+  SalesforcePartnerEventBusArn:
+    Type: String
+    Description: "Salesforce partner eventbus arn created from the Console. Stream salesforce events directly to Amazon EventBridge."
+  SalesforcePartnerEventPattern:
+    Type: String
+    Description: 'Salesforce partner event pattern interested to stream to eventbridge. eg: {"detail-type": ["CustomerSupport__e"]}'
+  SalesforceCaseFieldID:
+    Type: String
+    Description: "The field id of the custom case field created to store SFDC case id"
+  EventBridgeRateLimit:
+    Type: Number
+    Description: "API destination invocation rate limit per second"
+    Default: 10
+    MinValue: 1
+    MaxValue: 300
+
+# =============================================================================
+# AWS RESOURCES - Infrastructure components for the integration
+# =============================================================================
+Resources:
+  # =============================================================================
+  # SALESFORCE TO CONNECT INTEGRATION COMPONENTS
+  # =============================================================================
+
+  # SQS Queue to receive Salesforce events
+  SalesforceToConnectSQSQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MaximumMessageSize: 262144
+      MessageRetentionPeriod: 86400
+      QueueName: SalesforceToConnectQueue
+      SqsManagedSseEnabled: true
+
+  SalesforceToConnectSQSQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref SalesforceToConnectSQSQueue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowEventBridgeToSendMessage
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt SalesforceToConnectSQSQueue.Arn
+  SalesforceToConnectLambdaReadSQS:
+    # checkov:skip=CKV_AWS_117:Lambda function does not require VPC configuration for this use case
+    # checkov:skip=CKV_AWS_115:Lambda function does not require reserved concurrent executions for this use case
+    # checkov:skip=CKV_AWS_116:Lambda function does not require DLQ configuration for this use case
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W58
+            reason: "Lambda function does not require VPC configuration for this use case"
+          - id: W89
+            reason: "Lambda function does not require DLQ configuration for this use case"
+          - id: W92
+            reason: "Lambda function does not require reserved concurrent executions for this use case"
+    Properties:
+      CodeUri: sf-lambdas/read-sqs/
+      Handler: sfLambdaReadSQS.lambda_handler
+      Runtime: python3.13
+      Timeout: 60
+      FunctionName: SalesforceToConnectLambda-ReadSQS
+      Environment:
+        Variables:
+          SF_CASE_FIELD_ID:
+            Ref: SalesforceCaseFieldID
+          LOG_LEVEL: "INFO"
+  CloudWatchManagedPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Path: /
+      PolicyDocument:
+        Statement:
+          - Action:
+              - logs:CreateLogStream
+              - logs:CreateLogGroup
+              - logs:PutLogEvents
+            Effect: Allow
+            Resource:
+              - arn:aws:logs:*:*:*
+        Version: "2012-10-17"
+
+  SalesforceToConnectLambdaCPRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Effect: Allow
+          Principal:
+            Service:
+              - lambda.amazonaws.com
+          Action:
+            - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - !Ref CloudWatchManagedPolicy
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - profile:SearchProfiles
+                  - profile:CreateProfile
+                Effect: Allow
+                Resource: !Sub "arn:aws:profile:${AWS::Region}:${AWS::AccountId}:domains/*"
+            Version: "2012-10-17"
+          PolicyName: sfLambdaCPPolicy
+  SalesforceToConnectLambdaCasesRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: "The Cases actions requires wildcard resource , Refer: https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazonconnectcases.html#amazonconnectcases-Case"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Effect: Allow
+          Principal:
+            Service:
+              - lambda.amazonaws.com
+          Action:
+            - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - !Ref CloudWatchManagedPolicy
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - cases:CreateCase
+                  - cases:UpdateCase
+                  - cases:GetCase
+                  - cases:CreateRelatedItem
+                Effect: Allow
+                Resource:
+                  - !Sub "arn:aws:cases:${AWS::Region}:${AWS::AccountId}:domain/*"
+                  - !Sub "arn:aws:cases:${AWS::Region}:${AWS::AccountId}:domain/*/case/*"
+                  - !Sub "arn:aws:cases:${AWS::Region}:${AWS::AccountId}:domain/*/field/*"
+                  - !Sub "arn:aws:cases:${AWS::Region}:${AWS::AccountId}:domain/*/template/*"
+              - Action:
+                  - cases:ListDomains
+                Effect: Allow
+                Resource: "*"
+              - Action:
+                  - cases:ListTemplates
+                Effect: Allow
+                Resource: !Sub "arn:aws:cases:${AWS::Region}:${AWS::AccountId}:domain/*"
+              - Action:
+                  - profile:SearchProfiles
+                Effect: Allow
+                Resource: !Sub "arn:aws:profile:${AWS::Region}:${AWS::AccountId}:domains/${CPDomainName}"
+            Version: "2012-10-17"
+          PolicyName: sfLambdaCasesPolicy
+
+  SalesforceToConnectLambdaCPwPhone:
+    # checkov:skip=CKV_AWS_117:Lambda function does not require VPC configuration for this use case
+    # checkov:skip=CKV_AWS_115:Lambda function does not require reserved concurrent executions for this use case
+    # checkov:skip=CKV_AWS_116:Lambda function does not require DLQ configuration for this use case
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W58
+            reason: "Lambda function does not require VPC configuration for this use case"
+          - id: W89
+            reason: "Lambda function does not require DLQ configuration for this use case"
+          - id: W92
+            reason: "Lambda function does not require reserved concurrent executions for this use case"
+    Properties:
+      CodeUri: sf-lambdas/find-cp/
+      Handler: sfLambdaCP.lambda_handler
+      Runtime: python3.13
+      Timeout: 60
+      FunctionName: SalesforceToConnectLambda-findProfile
+      Role:
+        Fn::GetAtt: SalesforceToConnectLambdaCPRole.Arn
+      Environment:
+        Variables:
+          DOMAIN_NAME:
+            Ref: CPDomainName
+          COUNTRY_CODE: "+1"
+          MAX_SEARCH_RESULTS: "100"
+          LOG_LEVEL: "INFO"
+  SalesforceToConnectLambdaCreateCase:
+    # checkov:skip=CKV_AWS_117:Lambda function does not require VPC configuration for this use case
+    # checkov:skip=CKV_AWS_115:Lambda function does not require reserved concurrent executions for this use case
+    # checkov:skip=CKV_AWS_116:Lambda function does not require DLQ configuration for this use case
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W58
+            reason: "Lambda function does not require VPC configuration for this use case"
+          - id: W89
+            reason: "Lambda function does not require DLQ configuration for this use case"
+          - id: W92
+            reason: "Lambda function does not require reserved concurrent executions for this use case"
+    Properties:
+      CodeUri: sf-lambdas/create-case/
+      Handler: sfLambdaConnectCreateCase.lambda_handler
+      Runtime: python3.13
+      Timeout: 60
+      FunctionName: SalesforceToConnectLambda-CreateCase
+      Role:
+        Fn::GetAtt: SalesforceToConnectLambdaCasesRole.Arn
+      Environment:
+        Variables:
+          PROFILES_SUB: !Sub arn:aws:profile:${AWS::Region}:${AWS::AccountId}:domains/
+          DOMAIN_NAME:
+            Ref: CaseDomainName
+          PROFILES_DOMAIN:
+            Ref: CPDomainName
+          TEMPLATE_NAME:
+            Ref: TemplateName
+          SF_CASE_FIELD_ID:
+            Ref: SalesforceCaseFieldID
+          CLIENT_TOKEN_LENGTH: "8"
+          LOG_LEVEL: "INFO"
+
+  SalesforceToConnectLambdaUpdateCase:
+    # checkov:skip=CKV_AWS_117:Lambda function does not require VPC configuration for this use case
+    # checkov:skip=CKV_AWS_115:Lambda function does not require reserved concurrent executions for this use case
+    # checkov:skip=CKV_AWS_116:Lambda function does not require DLQ configuration for this use case
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W58
+            reason: "Lambda function does not require VPC configuration for this use case"
+          - id: W89
+            reason: "Lambda function does not require DLQ configuration for this use case"
+          - id: W92
+            reason: "Lambda function does not require reserved concurrent executions for this use case"
+    Properties:
+      CodeUri: sf-lambdas/update-case/
+      Handler: sfLambdaConnectUpdateCase.lambda_handler
+      Runtime: python3.13
+      Timeout: 60
+      FunctionName: SalesforceToConnectLambda-UpdateCase
+      Role:
+        Fn::GetAtt: SalesforceToConnectLambdaCasesRole.Arn
+      Environment:
+        Variables:
+          DOMAIN_NAME:
+            Ref: CaseDomainName
+          COMMENT_CONTENT_TYPE: "Text/Plain"
+          LOG_LEVEL: "INFO"
+          SF_CASE_FIELD_ID:
+            Ref: SalesforceCaseFieldID
+  SalesforceToConnectStateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Effect: Allow
+          Principal:
+            Service:
+              - states.amazonaws.com
+          Action:
+            - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Effect: Allow
+                Resource: "arn:aws:logs:*:*:*"
+              - Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Effect: Allow
+                Resource: !GetAtt SalesforceToConnectSQSQueue.Arn
+              - Action:
+                  - lambda:InvokeFunction
+                Effect: Allow
+                Resource:
+                  - !GetAtt SalesforceToConnectLambdaReadSQS.Arn
+                  - !GetAtt SalesforceToConnectLambdaCPwPhone.Arn
+                  - !GetAtt SalesforceToConnectLambdaCreateCase.Arn
+                  - !GetAtt SalesforceToConnectLambdaUpdateCase.Arn
+            Version: "2012-10-17"
+          PolicyName: sfEventPipePolicy
+  SalesforceToConnectStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      DefinitionString: !Sub
+        - |-
+          {
+            "Comment": "A description of my state machine",
+            "StartAt": "Receive SalesForce Event",
+            "States": {
+              "Receive SalesForce Event": {
+                "Type": "Pass",
+                "Comment": "Event received from EventBridge Pipe",
+                "Next": "Parse the SalesForce Event"
+              },
+              "Parse the SalesForce Event": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "OutputPath": "$.Payload",
+                "Parameters": {
+                  "Payload.$": "$",
+                  "FunctionName": "${sfLambdaQueueArn}"
+                },
+                "Retry": [
+                  {
+                    "ErrorEquals": [
+                      "Lambda.ServiceException",
+                      "Lambda.AWSLambdaException",
+                      "Lambda.SdkClientException",
+                      "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 3,
+                    "BackoffRate": 2
+                  }
+                ],
+                "Next": "Amazon Connect Case ID in Record?"
+              },
+              "Amazon Connect Case ID in Record?": {
+                "Type": "Choice",
+                "Choices": [
+                  {
+                    "Not": {
+                      "Variable": "$.AmazonConnectCaseID",
+                      "StringMatches": ""
+                    },
+                    "Next": "Check contact Exists?"
+                  },
+                  {
+                    "Variable": "$.AmazonConnectCaseID",
+                    "StringMatches": "",
+                    "Next": "Check Contact exists?"
+                  }
+                ]
+              },
+              "Check Contact exists?": {
+                "Type": "Choice",
+                "Choices": [
+                  {
+                    "And": [
+                      {
+                        "Variable": "$.PhoneNumber",
+                        "IsPresent": true
+                      },
+                      {
+                        "Not": {
+                          "Variable": "$.PhoneNumber",
+                          "StringMatches": ""
+                        }
+                      }
+                    ],
+                    "Next": "Fetch Customer Profile from  PhoneNumber"
+                  }
+                ],
+                "Default": "Phone Number Empty"
+              },
+              "Create Amazon Connect Case": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "OutputPath": "$.Payload",
+                "Parameters": {
+                  "Payload.$": "$",
+                  "FunctionName": "${sfLambdaCreateCaseArn}"
+                },
+                "Retry": [
+                  {
+                    "ErrorEquals": [
+                      "Lambda.ServiceException",
+                      "Lambda.AWSLambdaException",
+                      "Lambda.SdkClientException",
+                      "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 3,
+                    "BackoffRate": 2
+                  }
+                ],
+                "End": true
+              },
+              "Fetch Customer Profile from  PhoneNumber": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "OutputPath": "$.Payload",
+                "Parameters": {
+                  "FunctionName": "${sfLambdaCPPhoneArn}",
+                  "Payload.$": "$"
+                },
+                "Retry": [
+                  {
+                    "ErrorEquals": [
+                      "Lambda.ServiceException",
+                      "Lambda.AWSLambdaException",
+                      "Lambda.SdkClientException",
+                      "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 3,
+                    "BackoffRate": 2
+                  }
+                ],
+                "Next": "Create Amazon Connect Case"
+              },
+              "Phone Number Empty": {
+                "Type": "Fail",
+                "Error": "No Contact found",
+                "Cause": "There should be PhoneNumber for the contact"
+              },
+              "Check contact Exists?": {
+                "Type": "Choice",
+                "Choices": [
+                  {
+                    "Not": {
+                      "Variable": "$.PhoneNumber",
+                      "StringMatches": ""
+                    },
+                    "Next": "Fetch Customer Profile from Phone number"
+                  }
+                ],
+                "Default": "Update Amazon Connect Case"
+              },
+              "Fetch Customer Profile from Phone number": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "OutputPath": "$.Payload",
+                "Parameters": {
+                  "FunctionName": "${sfLambdaCPPhoneArn}",
+                  "Payload.$": "$"
+                },
+                "Retry": [
+                  {
+                    "ErrorEquals": [
+                      "Lambda.ServiceException",
+                      "Lambda.AWSLambdaException",
+                      "Lambda.SdkClientException",
+                      "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 3,
+                    "BackoffRate": 2
+                  }
+                ],
+                "Next": "Update Amazon Connect Case"
+              },
+              "Update Amazon Connect Case": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "OutputPath": "$.Payload",
+                "Parameters": {
+                  "Payload.$": "$",
+                  "FunctionName": "${sfLambdaUpdateCaseArn}"
+                },
+                "Retry": [
+                  {
+                    "ErrorEquals": [
+                      "Lambda.ServiceException",
+                      "Lambda.AWSLambdaException",
+                      "Lambda.SdkClientException",
+                      "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 3,
+                    "BackoffRate": 2
+                  }
+                ],
+                "End": true
+              },
+              "Empy Phone Number": {
+                "Type": "Fail",
+                "Error": "No Contact to fetch Profile",
+                "Cause": "There should be PhoneNumber for the contact"
+              }
+            }
+          }
+        - {
+            sfQueueURL: !GetAtt [SalesforceToConnectSQSQueue, QueueUrl],
+            sfLambdaQueueArn: !GetAtt [SalesforceToConnectLambdaReadSQS, Arn],
+            sfLambdaCPPhoneArn:
+              !GetAtt [SalesforceToConnectLambdaCPwPhone, Arn],
+            sfLambdaCreateCaseArn:
+              !GetAtt [SalesforceToConnectLambdaCreateCase, Arn],
+            sfLambdaUpdateCaseArn:
+              !GetAtt [SalesforceToConnectLambdaUpdateCase, Arn],
+          }
+      RoleArn:
+        Fn::GetAtt: SalesforceToConnectStateMachineRole.Arn
+
+  SalesforceToConnectEventPipeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Effect: Allow
+          Principal:
+            Service:
+              - pipes.amazonaws.com
+          Action:
+            - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - states:StartExecution
+                Effect: Allow
+                Resource: !Ref SalesforceToConnectStateMachine
+              - Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Effect: Allow
+                Resource: !GetAtt SalesforceToConnectSQSQueue.Arn
+            Version: "2012-10-17"
+          PolicyName: sfEventPipePolicy
+  SalesforceToConnectEventPipe:
+    Type: AWS::Pipes::Pipe
+    Properties:
+      RoleArn:
+        Fn::GetAtt: SalesforceToConnectEventPipeRole.Arn
+      Source:
+        Fn::GetAtt: SalesforceToConnectSQSQueue.Arn
+      Target:
+        Fn::GetAtt: SalesforceToConnectStateMachine.Arn
+      TargetParameters:
+        StepFunctionStateMachineParameters:
+          InvocationType: FIRE_AND_FORGET
+
+  # =============================================================================
+  # CONNECT TO SALESFORCE INTEGRATION COMPONENTS
+  # =============================================================================
+
+  # SQS Queue to receive Connect Cases events
+  ConnectToSalesforceSQSQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MaximumMessageSize: 262144
+      MessageRetentionPeriod: 86400
+      QueueName: ConnectToSalesforceQueue
+      SqsManagedSseEnabled: true
+
+  ConnectToSalesforceSQSQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref ConnectToSalesforceSQSQueue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowEventBridgeToSendMessage
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt ConnectToSalesforceSQSQueue.Arn
+
+  connectToSaleforceRule:
+    Type: "AWS::Events::Rule"
+    Properties:
+      Description: Routes to ConnectSF SQS
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.cases
+        detail-type:
+          - Amazon Connect Cases Change
+        detail:
+          eventType:
+            - "CASE.UPDATED"
+            - "CASE.CREATED"
+            - "RELATED_ITEM.CREATED"
+      Targets:
+        - Arn: !GetAtt ConnectToSalesforceSQSQueue.Arn
+          Id: "ConnectToSalesforceSQSQueueTarget"
+          RoleArn: !GetAtt ConnectToSFDCQueueRole.Arn
+  ConnectToSalesforceLambdaReadSQSRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Effect: Allow
+          Principal:
+            Service:
+              - lambda.amazonaws.com
+          Action:
+            - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - !Ref CloudWatchManagedPolicy
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - cases:GetCase
+                Effect: Allow
+                Resource: !Sub "arn:aws:cases:${AWS::Region}:${AWS::AccountId}:domain/*"
+              - Action:
+                  - profile:SearchProfiles
+                Effect: Allow
+                Resource: !Sub "arn:aws:profile:${AWS::Region}:${AWS::AccountId}:domains/*"
+            Version: "2012-10-17"
+          PolicyName: ConnectCasesReadPolicy
+
+  ConnectToSalesforceLambdaReadSQS:
+    # checkov:skip=CKV_AWS_117:Lambda function does not require VPC configuration for this use case
+    # checkov:skip=CKV_AWS_115:Lambda function does not require reserved concurrent executions for this use case
+    # checkov:skip=CKV_AWS_116:Lambda function does not require DLQ configuration for this use case
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W58
+            reason: "Lambda function does not require VPC configuration for this use case"
+          - id: W89
+            reason: "Lambda function does not require DLQ configuration for this use case"
+          - id: W92
+            reason: "Lambda function does not require reserved concurrent executions for this use case"
+    Properties:
+      CodeUri: connect-lambdas/read-sqs/
+      Handler: connectLambdaReadSQS.lambda_handler
+      Runtime: python3.13
+      Timeout: 60
+      FunctionName: ConnectToSalesforceLambda-ReadSQS
+      Role:
+        Fn::GetAtt: ConnectToSalesforceLambdaReadSQSRole.Arn
+      Environment:
+        Variables:
+          PROFILES_DOMAIN:
+            Ref: CPDomainName
+          SF_CASE_FIELD_ID:
+            Ref: SalesforceCaseFieldID
+          LOG_LEVEL: "INFO"
+
+  ConnectToSalesforceLambdaCasesRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Effect: Allow
+          Principal:
+            Service:
+              - lambda.amazonaws.com
+          Action:
+            - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - !Ref CloudWatchManagedPolicy
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - cases:GetCase
+                Effect: Allow
+                Resource: !Sub "arn:aws:cases:${AWS::Region}:${AWS::AccountId}:domain/*"
+            Version: "2012-10-17"
+          PolicyName: ConLambdaCasesPolicy
+
+        - PolicyName: EventAccessPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource:
+                  - !GetAtt EventbridgeToSalesforceEventbus.Arn
+                  - !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/default"
+
+  ConnectToSalesforceLambdaCreateUpdateCase:
+    # checkov:skip=CKV_AWS_117:Lambda function does not require VPC configuration for this use case
+    # checkov:skip=CKV_AWS_115:Lambda function does not require reserved concurrent executions for this use case
+    # checkov:skip=CKV_AWS_116:Lambda function does not require DLQ configuration for this use case
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W58
+            reason: "Lambda function does not require VPC configuration for this use case"
+          - id: W89
+            reason: "Lambda function does not require DLQ configuration for this use case"
+          - id: W92
+            reason: "Lambda function does not require reserved concurrent executions for this use case"
+    Properties:
+      CodeUri: connect-lambdas/create-case/
+      Handler: connectLambdaCreateOrUpdateCase.lambda_handler
+      Runtime: python3.13
+      Timeout: 60
+      FunctionName: ConnectToSalesforceLambda-CreateUpdateCase
+      Role:
+        Fn::GetAtt: ConnectToSalesforceLambdaCasesRole.Arn
+      Environment:
+        Variables:
+          EVENT_BUS_NAME: !Ref EventbridgeToSalesforceEventbus
+          CASE_ORIGIN: "Phone"
+          CASE_STATUS: "New"
+          LOG_LEVEL: "INFO"
+  ConnectToSalesforceStateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Effect: Allow
+          Principal:
+            Service:
+              - states.amazonaws.com
+          Action:
+            - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Effect: Allow
+                Resource: "arn:aws:logs:*:*:*"
+              - Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Effect: Allow
+                Resource: !GetAtt ConnectToSalesforceSQSQueue.Arn
+              - Action:
+                  - lambda:InvokeFunction
+                Effect: Allow
+                Resource:
+                  - !GetAtt ConnectToSalesforceLambdaReadSQS.Arn
+                  - !GetAtt ConnectToSalesforceLambdaCreateUpdateCase.Arn
+            Version: "2012-10-17"
+          PolicyName: conEventPipePolicy
+  ConnectToSalesforceStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      DefinitionString: !Sub
+        - |-
+          {
+            "Comment": "A description of my state machine",
+            "StartAt": "Receive Connect Case Event",
+            "States": {
+              "Receive Connect Case Event": {
+                "Type": "Pass",
+                "Comment": "Event received from EventBridge Pipe",
+                "Next": "Parse the Connect Case Event"
+              },
+              "Parse the Connect Case Event": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "OutputPath": "$.Payload",
+                "Parameters": {
+                  "Payload.$": "$",
+                  "FunctionName": "${cLambdaQueueArn}"
+                },
+                "Retry": [
+                  {
+                    "ErrorEquals": [
+                      "Lambda.ServiceException",
+                      "Lambda.AWSLambdaException",
+                      "Lambda.SdkClientException",
+                      "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 3,
+                    "BackoffRate": 2
+                  }
+                ],
+                "Next": "Is this a valid event?"
+              },
+              "Is this a valid event?": {
+                "Type": "Choice",
+                "Choices": [
+                  {
+                    "Or": [
+                      {
+                        "Variable": "$.sfStatus",
+                        "StringMatches": "ignore"
+                      },
+                      {
+                        "Variable": "$.sfStatus",
+                        "StringMatches": "IGNORE"
+                      }
+                    ],
+                    "Next": "Do Nothing"
+                  },
+                  {
+                    "Or": [
+                      {
+                        "Variable": "$.sfStatus",
+                        "StringMatches": "UPDATE"
+                      },
+                      {
+                        "Variable": "$.sfStatus",
+                        "StringMatches": "update"
+                      },
+                      {
+                        "Variable": "$.sfStatus",
+                        "StringMatches": "CREATE"
+                      },
+                      {
+                        "Variable": "$.sfStatus",
+                        "StringMatches": "create"
+                      },
+                      {
+                        "Variable": "$.sfStatus",
+                        "StringMatches": "COMMENT"
+                      },
+                      {
+                        "Variable": "$.sfStatus",
+                        "StringMatches": "comment"
+                      }
+                    ],
+                    "Next": "Form Create/Update event"
+                  }
+                ],
+                "Default": "Do Nothing"
+              },
+              "Do Nothing": {
+                "Type": "Succeed",
+                "Comment": "Do Nothing"
+              },
+              "Form Create/Update event": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "OutputPath": "$.Payload",
+                "Parameters": {
+                  "Payload.$": "$",
+                  "FunctionName": "${cLambdaCreateUpdateCaseArn}"
+                },
+                "Retry": [
+                  {
+                    "ErrorEquals": [
+                      "Lambda.ServiceException",
+                      "Lambda.AWSLambdaException",
+                      "Lambda.SdkClientException",
+                      "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 3,
+                    "BackoffRate": 2
+                  }
+                ],
+                "Next": "Event sent to SalesForce"
+              },
+              "Event sent to SalesForce": {
+                "Type": "Succeed"
+              }
+            }
+          }
+        - {
+            cQueueURL: !GetAtt [ConnectToSalesforceSQSQueue, QueueUrl],
+            cLambdaQueueArn: !GetAtt [ConnectToSalesforceLambdaReadSQS, Arn],
+            cLambdaCreateUpdateCaseArn:
+              !GetAtt [ConnectToSalesforceLambdaCreateUpdateCase, Arn],
+          }
+      RoleArn:
+        Fn::GetAtt: ConnectToSalesforceStateMachineRole.Arn
+
+  ConnectToSalesforceEventPipeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Effect: Allow
+          Principal:
+            Service:
+              - pipes.amazonaws.com
+          Action:
+            - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - states:StartExecution
+                Effect: Allow
+                Resource: !Ref ConnectToSalesforceStateMachine
+              - Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Effect: Allow
+                Resource: !GetAtt ConnectToSalesforceSQSQueue.Arn
+            Version: "2012-10-17"
+          PolicyName: cEventPipePolicy
+  ConnectToSalesforceEventPipe:
+    Type: AWS::Pipes::Pipe
+    Properties:
+      RoleArn:
+        Fn::GetAtt: ConnectToSalesforceEventPipeRole.Arn
+      Source:
+        Fn::GetAtt: ConnectToSalesforceSQSQueue.Arn
+      Target:
+        Fn::GetAtt: ConnectToSalesforceStateMachine.Arn
+      TargetParameters:
+        StepFunctionStateMachineParameters:
+          InvocationType: FIRE_AND_FORGET
+  ##################################################################################
+  #                   API Destination to Salesforce Configuration                  #
+  ##################################################################################
+  # Eventbus used to send events to Salesforce
+  EventbridgeToSalesforceEventbus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: EventbridgeToSalesforceEventbus
+  # API Destination IAM Permissions
+  EventbridgeAPIDestinationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: AllowAPIDestinationAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "events:InvokeApiDestination"
+                Resource: [!GetAtt SalesforceDestination.Arn]
+  # Establishing Connection to Salesforce Account
+  SalesforceConnection:
+    Type: AWS::Events::Connection
+    Properties:
+      Description: "My connection with Salesforce through OAuth"
+      AuthorizationType: OAUTH_CLIENT_CREDENTIALS
+      AuthParameters:
+        OAuthParameters:
+          AuthorizationEndpoint: !Ref SalesforceOauthUrl
+          ClientParameters:
+            ClientID: !Ref SalesforceOauthClientId
+            ClientSecret: !Ref SalesforceOauthClientSecret
+          HttpMethod: POST
+          OAuthHttpParameters:
+            BodyParameters:
+              - Key: "grant_type"
+                Value: "client_credentials"
+                IsValueSecret: false
+  # API Destination to SalesForce
+  SalesforceDestination:
+    Type: AWS::Events::ApiDestination
+    Properties:
+      Name: "SfdcAPIDestination"
+      ConnectionArn:
+        Fn::GetAtt: [SalesforceConnection, Arn]
+      InvocationEndpoint: !Ref SalesforceCaseProcessorEndpointUrl
+      HttpMethod: POST
+      InvocationRateLimitPerSecond: !Ref EventBridgeRateLimit
+  # EventBridge rule to stream salesforce events directly to Amazon EventBridge.
+  SalesforceEventDeliveryRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Stream salesforce events directly to Amazon EventBridge"
+      EventBusName: !Ref SalesforcePartnerEventBusArn
+      EventPattern: !Ref SalesforcePartnerEventPattern
+      State: "ENABLED"
+      Targets:
+        - Arn: !GetAtt SalesforceToConnectSQSQueue.Arn
+          Id: SalesforceEventTarget
+          RoleArn: !GetAtt ExecuteCaseProcessorStateMachineRole.Arn
+  # EventBridge IAM Role to start statemachine processor
+  ExecuteCaseProcessorStateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: "sendtoSQSPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "sqs:SendMessage"
+                Resource: !GetAtt SalesforceToConnectSQSQueue.Arn
+  # EventBridge IAM Role to start statemachine processor
+  ConnectToSFDCQueueRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: "sendtoSQSPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "sqs:SendMessage"
+                Resource: !GetAtt ConnectToSalesforceSQSQueue.Arn
+        - PolicyName: AllowAPIDestinationAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "events:InvokeApiDestination"
+                Resource: [!GetAtt SalesforceDestination.Arn]
+  # EventBridge rule to create case in Salesforce
+  ConnectToSFDCQueueEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "EventBridge rule to create case in Salesforce"
+      EventBusName: !Ref EventbridgeToSalesforceEventbus
+      EventPattern:
+        source:
+          - "case.event"
+        account:
+          - !Ref AWS::AccountId
+      State: "ENABLED"
+      Targets:
+        # Cloudwatch target
+        # - Arn: !GetAtt ConnectToSFDCQueueLogGroup.Arn
+        #   Id: LogTarget
+        # API destination target
+        - Id: SalesforceAPI
+          Arn: !GetAtt SalesforceDestination.Arn
+          RoleArn: !GetAtt ConnectToSFDCQueueRole.Arn
+          # API Destination target
+          InputTransformer:
+            InputPathsMap:
+              "sf_operation": "$.detail.sf_operation"
+              "Origin": "$.detail.Origin"
+              "Status": "$.detail.Status"
+              "Subject": "$.detail.Subject"
+              "Description": "$.detail.Description"
+              "AmazonConnectCaseID": "$.detail.AmazonConnectCaseID"
+              "Comments": "$.detail.Comments"
+              "SalesforceCaseID": "$.detail.SalesforceCaseID"
+              "PhoneNumber": "$.detail.PhoneNumber"
+            InputTemplate: |
+              {
+                "sf_operation__c": "<sf_operation>",
+                "Origin__c": "<Origin>",
+                "Status__c": "<Status>",
+                "Subject__c": "<Subject>",
+                "Description__c": "<Description>",
+                "AmazonConnectCaseID__c": "<AmazonConnectCaseID>",
+                "Comments__c": "<Comments>",
+                "CaseID__c": "<SalesforceCaseID>",
+                "Phone_Number__c": "<PhoneNumber>"
+              }
